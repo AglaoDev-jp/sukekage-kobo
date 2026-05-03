@@ -48,6 +48,8 @@ from tkinter import ttk, filedialog, messagebox
 
 from PIL import Image, ImageFilter, ImageChops, ImageTk
 
+import json
+
 # ============================================================
 # 影絵生成ロジック
 # ============================================================
@@ -178,7 +180,7 @@ def generate_silhouette_rgba(img_rgba: Image.Image, params: SilhouetteParams) ->
     w, h = img.size
 
     # --- αチャンネル抽出 ---
-    a0 = img.getchannel("A")
+    r, g, b, a0 = img.split()
 
     # --- 影の色（inner_shade + color preset） ---
     preset_rgb = COLOR_PRESETS.get(params.color_preset, COLOR_PRESETS["灰"])
@@ -265,18 +267,18 @@ def process_file_to_file(input_path: Path, output_path: Path, params: Silhouette
 
 def make_unique_output_path(out_dir: Path, base_stem: str) -> Path:
     """
-    出力名：{元名}_silhouette.png
-    重複時は {元名}_silhouette_001.png, _002... のように連番を付ける
+    出力名：sil_{元名}.png
+    重複時は sil_{元名}_001.png, _002... のように連番を付ける
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    candidate = out_dir / f"{base_stem}_silhouette.png"
+    candidate = out_dir / f"sil_{base_stem}.png"
     if not candidate.exists():
         return candidate
 
     # 連番
     for i in range(1, 10000):
-        candidate = out_dir / f"{base_stem}_silhouette_{i:03d}.png"
+        candidate = out_dir / f"sli{base_stem}_{i:03d}.png"
         if not candidate.exists():
             return candidate
 
@@ -350,9 +352,12 @@ class SukekageApp(tk.Tk):
         self.var_add_outline = tk.BooleanVar(value=True)
         self.var_outline_thickness = tk.IntVar(value=2)
 
-        # inner_shade は元スクリプトにありましたが、要件に明示がないので「固定」にしています。
-        # ここをGUI化したい場合は改良案で提案します。
+        # inner_shade は「固定」にしています。
         self._inner_shade_fixed = 24
+
+        # --- プレビュー初回自動表示用フラグ ---
+        # 単発画像 or フォルダを選んだ直後の “初回だけ” 自動プレビューを行う
+        self._auto_preview_done: bool = False
 
         # --- 画面構築 ---
         self._build_ui()
@@ -604,16 +609,22 @@ class SukekageApp(tk.Tk):
     def _build_action_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="操作", padding=10)
         frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
-        frame.columnconfigure(2, weight=1)
 
+        # 4列 × 2段 くらいにして窮屈にならないようにする
+        for c in range(4):
+            frame.columnconfigure(c, weight=1)
+
+        # 1段目：プレビュー/実行系
         ttk.Button(frame, text="プレビュー更新", command=self.on_update_preview).grid(row=0, column=0, sticky="ew")
         ttk.Button(frame, text="単発 実行", command=self.on_run_single).grid(row=0, column=1, sticky="ew", padx=(10, 10))
         ttk.Button(frame, text="一括 実行", command=self.on_run_batch).grid(row=0, column=2, sticky="ew")
-
         self.btn_cancel = ttk.Button(frame, text="キャンセル", command=self.on_cancel, state=tk.DISABLED)
-        self.btn_cancel.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.btn_cancel.grid(row=0, column=3, sticky="ew", padx=(10, 0))
+
+        # 2段目：プリセット
+        # 自動保存・自動読込は行わず、必要なときだけプリセットとして保存/読込します。
+        ttk.Button(frame, text="プリセット保存", command=self.save_preset_as).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(frame, text="プリセット読込", command=self.load_preset_from).grid(row=1, column=2, columnspan=2, sticky="ew", padx=(10, 0), pady=(8, 0))
 
     def _build_log_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="ログ", padding=10)
@@ -698,6 +709,157 @@ class SukekageApp(tk.Tk):
         )
 
     # ----------------------------
+    # プリセット（JSON） 保存/読込
+    # ----------------------------
+
+    def _collect_settings_dict(self) -> dict:
+        """
+        現在のUI変数から「保存用dict」を作る。
+        JSONにできる型（int/float/bool/str/None）だけで構成する。
+        """
+        return {
+            "version": 1,  # 将来、項目が増えた時のためにバージョンを入れておく
+            "target_alpha": int(self.var_target_alpha.get()),
+            "feather": float(self.var_feather.get()),
+
+            "use_tint": bool(self.var_use_tint.get()),
+            "color_preset": str(self.var_color_preset.get()),
+            "color_strength": int(self.var_color_strength.get()),
+
+            "add_grain": bool(self.var_add_grain.get()),
+            "grain_strength": int(self.var_grain_strength.get()),
+
+            "add_texture": bool(self.var_add_texture.get()),
+            "texture_path": str(self.var_texture_path.get() or ""),
+
+            "add_outline": bool(self.var_add_outline.get()),
+            "outline_thickness": int(self.var_outline_thickness.get()),
+        }
+
+    def _apply_settings_dict(self, d: dict) -> None:
+        """
+        保存dictからUI変数へ反映する。
+        不正値はclampして安全側に倒す。
+        """
+        # dictでないものが来たら無視
+        if not isinstance(d, dict):
+            return
+
+        if "target_alpha" in d:
+            self.var_target_alpha.set(clamp_int(int(d["target_alpha"]), 0, 255))
+        if "feather" in d:
+            self.var_feather.set(clamp_float(float(d["feather"]), 0.0, 10.0))
+
+        if "use_tint" in d:
+            self.var_use_tint.set(bool(d["use_tint"]))
+
+        if "color_preset" in d:
+            preset = str(d["color_preset"])
+            # 追加/削除されていても落ちないようにフォールバック
+            if preset not in COLOR_PRESETS:
+                preset = "灰"
+            self.var_color_preset.set(preset)
+
+        if "color_strength" in d:
+            self.var_color_strength.set(clamp_int(int(d["color_strength"]), 0, 255))
+
+        if "add_grain" in d:
+            self.var_add_grain.set(bool(d["add_grain"]))
+        if "grain_strength" in d:
+            self.var_grain_strength.set(clamp_int(int(d["grain_strength"]), 0, 64))
+
+        if "add_texture" in d:
+            self.var_add_texture.set(bool(d["add_texture"]))
+        if "texture_path" in d:
+            self.var_texture_path.set(str(d["texture_path"] or ""))
+            # ラベル表示も同期（UI上の見た目の一貫性）
+            p = self.var_texture_path.get().strip()
+            self.lbl_texture.configure(text=shorten_path(p) if p else "未選択")
+
+        if "add_outline" in d:
+            self.var_add_outline.set(bool(d["add_outline"]))
+        if "outline_thickness" in d:
+            self.var_outline_thickness.set(clamp_int(int(d["outline_thickness"]), 1, 4))
+
+        # tint ON/OFFに応じてUI状態を整える（disabled/readonlyなど）
+        self._update_tint_ui_state()
+
+        # スライダー/Entry表示を同期（見た目がズレないように）
+        self.ent_target_alpha.delete(0, tk.END)
+        self.ent_target_alpha.insert(0, str(self.var_target_alpha.get()))
+
+        self.ent_feather.delete(0, tk.END)
+        self.ent_feather.insert(0, f"{self.var_feather.get():.2f}")
+
+        self.ent_color_strength.delete(0, tk.END)
+        self.ent_color_strength.insert(0, str(self.var_color_strength.get()))
+
+        self.ent_grain_strength.delete(0, tk.END)
+        self.ent_grain_strength.insert(0, str(self.var_grain_strength.get()))
+
+        self.ent_outline_thick.delete(0, tk.END)
+        self.ent_outline_thick.insert(0, str(self.var_outline_thickness.get()))
+
+    def _write_settings_file(self, path: Path) -> None:
+        """
+        指定パスへ設定を書き込む（例外は呼び出し側で扱う）
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = self._collect_settings_dict()
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _read_settings_file(self, path: Path) -> dict:
+        """
+        指定パスから設定を読み込む（例外は呼び出し側で扱う）
+        """
+        raw = path.read_text(encoding="utf-8")
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            raise ValueError("設定ファイルの形式が不正です（dictではありません）。")
+        return d
+
+    def save_preset_as(self) -> None:
+        """
+        任意の場所へプリセットとして保存（複数プリセット運用向け）
+        """
+        path = filedialog.asksaveasfilename(
+            title="プリセットを保存（JSON）",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")]
+        )
+        if not path:
+            return
+
+        try:
+            p = Path(path)
+            self._write_settings_file(p)
+            self.log(f"プリセットを保存しました: {p}")
+        except Exception as e:
+            self.log(f"プリセット保存に失敗: {e}")
+            messagebox.showwarning("注意", f"プリセットの保存に失敗しました。\n\n{e}")
+
+    def load_preset_from(self) -> None:
+        """
+        任意のプリセットを読み込む（複数プリセット運用向け）
+        """
+        path = filedialog.askopenfilename(
+            title="プリセットを読み込む（JSON）",
+            filetypes=[("JSON", "*.json")]
+        )
+        if not path:
+            return
+
+        try:
+            p = Path(path)
+            d = self._read_settings_file(p)
+            self._apply_settings_dict(d)
+
+            self.log(f"プリセットを読み込みました: {p}")
+        except Exception as e:
+            self.log(f"プリセット読込に失敗: {e}")
+            messagebox.showwarning("注意", f"プリセットの読み込みに失敗しました。\n\n{e}")
+
+    # ----------------------------
     # ファイル/フォルダ選択
     # ----------------------------
 
@@ -714,11 +876,17 @@ class SukekageApp(tk.Tk):
         # ★UI表示だけ短縮
         self.lbl_in_file.configure(text=shorten_path(path))
 
+        # --- 初回だけ自動プレビュー ---
+        if not self._auto_preview_done:
+            self._auto_preview_done = True
+            # UIが固まるのを避けて、afterで少し遅延して実行（tkの描画が落ち着いてから）
+            self.after(50, self.on_update_preview)
+
         # （ログはフルパスでOK）
         self.log(f"入力画像: {path}")
 
         # 入力を選んだら、出力ファイルのデフォルトも提案（同じフォルダ）
-        default_out = self.input_file.with_name(f"{self.input_file.stem}_silhouette.png")
+        default_out = self.input_file.with_name(f"sil_{self.input_file.stem}.png")
         self.output_file = default_out
 
         # 短縮表示にする
@@ -753,7 +921,12 @@ class SukekageApp(tk.Tk):
         self.lbl_in_dir.configure(text=shorten_path(path))
         self.log(f"入力フォルダ: {path}")
 
+        # --- 初回だけ自動プレビュー（フォルダは先頭PNG） ---
+        if not self._auto_preview_done:
+            self._auto_preview_done = True
+            self.after(50, self.on_update_preview)
 
+            
     def on_pick_output_dir(self) -> None:
         path = filedialog.askdirectory(title="出力フォルダを選択")
         if not path:
@@ -779,28 +952,52 @@ class SukekageApp(tk.Tk):
 
         self.log(f"テクスチャ: {path}")
 
+    
     # ----------------------------
     # プレビュー
     # ----------------------------
+    
+    def _get_preview_input_path(self) -> Optional[Path]:
+        """
+        プレビューで使う入力画像パスを決める。
+
+        優先順位：
+        1) 単発の input_file があればそれ
+        2) フォルダ input_dir があれば、その中の先頭PNG
+        """
+        if self.input_file is not None and self.input_file.exists():
+            return self.input_file
+
+        if self.input_dir is not None and self.input_dir.exists():
+            pngs = sorted(self.input_dir.glob("*.png"))
+            if pngs:
+                return pngs[0]
+
+        return None
+
 
     def on_update_preview(self) -> None:
         """
-        プレビューは「自動更新しない」要件なので、ボタン押下で更新します。
+        プレビューは「ボタン更新」が基本。
+        ただし、入力選択直後の初回のみ自動表示を呼ぶ（別箇所からこの関数を呼ぶ）
         """
-        if self.input_file is None or not self.input_file.exists():
+        src = self._get_preview_input_path()
+        if src is None or not src.exists():
             messagebox.showwarning("注意", "プレビューする入力画像が未選択です。")
             return
 
         try:
             # 入力読み込み
-            self._preview_in_pil = Image.open(self.input_file).convert("RGBA")
+            self._preview_in_pil = Image.open(src).convert("RGBA")
 
             # 出力生成（メモリ内）
             params = self.get_params()
             self._preview_out_pil = generate_silhouette_rgba(self._preview_in_pil, params)
 
             self._render_previews()
-            self.log("プレビュー更新しました。")
+
+            # どの画像でプレビューしたかログに出すと親切
+            self.log(f"プレビュー更新: {src.name}")
         except Exception as e:
             self.log(f"プレビュー失敗: {e}")
             messagebox.showerror("エラー", f"プレビューに失敗しました。\n\n{e}")
@@ -918,7 +1115,7 @@ class SukekageApp(tk.Tk):
     def _batch_worker(self, files: List[Path], out_dir: Path, params: SilhouetteParams) -> None:
         """
         別スレッドで実行される一括処理。
-        UI更新は queue 経由で行う（Tkinterはスレッドセーフではないため）。
+        UI更新は queue 経由で行う（Tkinterはスレッドセーフではないため）
         """
         total = len(files)
         processed = 0
@@ -986,7 +1183,7 @@ class SukekageApp(tk.Tk):
 
     def _sync_int_scale(self, var: tk.IntVar, entry: ttk.Entry) -> None:
         """
-        ttk.Scale は float を返すので、表示は int に整えて entry に反映する
+        ttk.Scale は float を返すので、表示は int に整えて entry に反映する。
         """
         v = int(float(var.get()))
         var.set(v)
@@ -995,7 +1192,7 @@ class SukekageApp(tk.Tk):
 
     def _sync_float_scale(self, var: tk.DoubleVar, entry: ttk.Entry) -> None:
         """
-        float系（フェザー）は小数2桁表示にして entry に反映する
+        float系（フェザー）は小数2桁表示にして entry に反映する。
         """
         v = float(var.get())
         entry.delete(0, tk.END)
